@@ -1,0 +1,226 @@
+# ================== Google Colab: 단계별 요약 배지(현재+누적 합계) ==================
+!pip -q install ipywidgets
+
+import re
+from ipywidgets import VBox, HBox, HTML, Text, FloatText, Checkbox, RadioButtons, Button, Layout, Dropdown
+from IPython.display import display
+
+# ----- 마스터 테이블 (단위: kg CO2e/kg) -----
+MASTER = {
+    "1. 농장": {
+        "소고기": 48.0, "돼지고기": 5.5, "닭고기": 4.8, "계란": 2.5,
+        "유제품": 2.0, "쌀": 3.0, "과일": 0.4, "채소": 0.2,
+        "수산물(양식)": 3.5, "수산물(자연산)": 1.5,
+    },
+    "2. 공장": {"가공": 0.4, "살균/멸균": 0.3, "포장": 0.2},
+    "3. 유통": {"국산": 0.1, "해상운송(수입)": 2.0, "항공운송(수입)": 25.0},
+    "4. 매장": {"냉장/냉동": 0.2, "조명 및 기타 에너지": 0.1, "식품 폐기": 0.2},
+}
+
+# ===== 유틸 =====
+def to_kg(amount_value: float, unit_value: str, pname_value: str) -> float:
+    unit_value = unit_value.lower()
+    if unit_value == "g":
+        grams = amount_value
+    elif unit_value == "kg":
+        return round(float(amount_value), 3)
+    elif unit_value in ("ml", "l"):
+        dens = 1.03 if re.search(r'우유|milk', pname_value, re.I) else 1.0
+        ml_val = amount_value * (1000 if unit_value == "l" else 1)
+        grams = ml_val * dens
+    else:
+        grams = amount_value
+    return round(grams / 1000.0, 3)
+
+def calc(selected_by_stage: dict, kg_amount: float):
+    breakdown = []
+    coef = 0.0
+    order = ["1. 농장","2. 공장","3. 유통","4. 매장"]
+    for stage in order:
+        for tag in selected_by_stage.get(stage, []):
+            ef = MASTER[stage][tag]
+            coef += ef
+            breakdown.append((stage, tag, ef))
+    total = round(kg_amount * coef, 3)
+    return round(coef, 3), round(kg_amount, 3), total, breakdown
+
+def make_checkboxes(stage):
+    return [Checkbox(description=f"{k} ({MASTER[stage][k]})", value=False) for k in MASTER[stage].keys()]
+
+def clear_boxes(boxes):
+    for b in boxes:
+        b.value = False
+
+# ===== 위젯 정의 =====
+title = HTML("<h3>식품 탄소 발자국 계산 위저드</h3>")
+pname = Text(description="제품명", placeholder="예) 서울우유 200ml / 국산 노지 시금치 100g")
+amount = FloatText(value=100.0, description="섭취량")
+amount_unit = Dropdown(options=["g","ml","kg","L"], value="g", description="단위")
+
+# 경고
+warn_farm = HTML("", layout=Layout(margin="4px 0", height="20px"))
+warn_factory = HTML("", layout=Layout(margin="4px 0", height="20px"))
+warn_dist = HTML("", layout=Layout(margin="4px 0", height="20px"))
+warn_store = HTML("", layout=Layout(margin="4px 0", height="20px"))
+
+# 버튼
+to_farm_btn   = Button(description="다음 ▶ 농장", button_style="primary")
+to_factory_btn = Button(description="다음 ▶ 공장", button_style="primary")
+to_dist_btn   = Button(description="다음 ▶ 유통", button_style="primary")
+to_store_btn  = Button(description="다음 ▶ 매장", button_style="primary")
+finish_btn    = Button(description="계산하기", button_style="success")
+
+back_from_farm    = Button(description="◀ 이전(시작)")
+back_from_factory = Button(description="◀ 이전(농장)")
+back_from_dist    = Button(description="◀ 이전(공장)")
+back_from_store   = Button(description="◀ 이전(유통)")
+
+# 단계별 선택
+farm_boxes = make_checkboxes("1. 농장")
+factory_boxes = make_checkboxes("2. 공장")
+dist_kind = RadioButtons(
+    options=["국산","해상운송(수입)","항공운송(수입)"],
+    description="유통", layout=Layout(width="auto")
+)
+store_boxes = make_checkboxes("4. 매장")
+
+# ===== 배지 CSS =====
+badge_css = "font-size:12px;color:#bbb;border:1px solid #444;padding:4px 8px;border-radius:10px;display:inline-block;margin-top:6px;"
+badge_farm = HTML("")
+badge_factory = HTML("")
+badge_dist = HTML("")
+badge_store = HTML("")
+
+# ===== 배지 업데이트 함수 =====
+def update_badge_farm(_=None):
+    cur = sum(MASTER["1. 농장"][b.description.split(" (")[0]] for b in farm_boxes if b.value)
+    badge_farm.value = f"<span style='{badge_css}'>현재 선택합: {round(cur,3)} / 누적합계: {round(cur,3)}</span>"
+
+def update_badge_factory(_=None):
+    cur = sum(MASTER["2. 공장"][b.description.split(" (")[0]] for b in factory_boxes if b.value)
+    prev = sum(MASTER["1. 농장"][b.description.split(' (')[0]] for b in farm_boxes if b.value)
+    badge_factory.value = f"<span style='{badge_css}'>현재 선택합: {round(cur,3)} / 누적합계: {round(prev+cur,3)}</span>"
+
+def update_badge_dist(_=None):
+    cur = MASTER["3. 유통"].get(dist_kind.value, 0.0) if dist_kind.value else 0.0
+    prev = sum(MASTER["1. 농장"][b.description.split(' (')[0]] for b in farm_boxes if b.value) \
+             + sum(MASTER["2. 공장"][b.description.split(' (')[0]] for b in factory_boxes if b.value)
+    badge_dist.value = f"<span style='{badge_css}'>현재 선택합: {round(cur,3)} / 누적합계: {round(prev+cur,3)}</span>"
+
+def update_badge_store(_=None):
+    cur = sum(MASTER["4. 매장"][b.description.split(" (")[0]] for b in store_boxes if b.value)
+    prev = sum(MASTER["1. 농장"][b.description.split(' (')[0]] for b in farm_boxes if b.value) \
+             + sum(MASTER["2. 공장"][b.description.split(' (')[0]] for b in factory_boxes if b.value) \
+             + (MASTER["3. 유통"].get(dist_kind.value, 0.0) if dist_kind.value else 0.0)
+    badge_store.value = f"<span style='{badge_css}'>현재 선택합: {round(cur,3)} / 누적합계: {round(prev+cur,3)}</span>"
+
+# 관찰자 연결
+for b in farm_boxes:    b.observe(update_badge_farm, names="value")
+for b in factory_boxes: b.observe(update_badge_factory, names="value")
+dist_kind.observe(update_badge_dist, names="value")
+for b in store_boxes:   b.observe(update_badge_store, names="value")
+
+# ===== UI 레이아웃 =====
+box0 = VBox([title, pname, HBox([amount, amount_unit]), to_farm_btn])
+box1 = VBox([HTML("<b>① 농장 단계</b>"), HBox(farm_boxes), warn_farm, badge_farm,
+             HBox([back_from_farm, to_factory_btn])], layout=Layout(display="none"))
+box2 = VBox([HTML("<b>② 공장 단계</b>"), HBox(factory_boxes), warn_factory, badge_factory,
+             HBox([back_from_factory, to_dist_btn])], layout=Layout(display="none"))
+box3 = VBox([HTML("<b>③ 유통 단계</b>"), dist_kind, warn_dist, badge_dist,
+             HBox([back_from_dist, to_store_btn])], layout=Layout(display="none"))
+box4 = VBox([HTML("<b>④ 매장 단계</b>"), HBox(store_boxes), warn_store, badge_store,
+             HBox([back_from_store, finish_btn])], layout=Layout(display="none"))
+
+out = HTML()
+display(VBox([box0, box1, box2, box3, box4, HTML("<hr>"), out]))
+
+# ===== 화면 제어 함수 =====
+def show_only(idx):
+    boxes = [box0, box1, box2, box3, box4]
+    for i, b in enumerate(boxes):
+        b.layout.display = "block" if i == idx else "none"
+    out.value = ""
+
+def reset_from(idx):
+    if idx <= 1:
+        clear_boxes(farm_boxes); update_badge_farm()
+    if idx <= 2:
+        clear_boxes(factory_boxes); update_badge_factory()
+    if idx <= 3:
+        dist_kind.value = None; update_badge_dist()
+    if idx <= 4:
+        clear_boxes(store_boxes); update_badge_store()
+    warn_farm.value = warn_factory.value = warn_dist.value = warn_store.value = ""
+
+# ===== 버튼 이벤트 =====
+def go_to_farm(_):
+    show_only(1)
+
+def to_factory(_):
+    if not any(b.value for b in farm_boxes):
+        warn_farm.value = "<span style='color:red'>체크하지 않았습니다.</span>"
+        return
+    show_only(2)
+
+def to_dist(_):
+    if not any(b.value for b in factory_boxes):
+        warn_factory.value = "<span style='color:red'>체크하지 않았습니다.</span>"
+        return
+    show_only(3)
+
+def to_store(_):
+    if not dist_kind.value:
+        warn_dist.value = "<span style='color:red'>체크하지 않았습니다.</span>"
+        return
+    show_only(4)
+
+def back_to_start(_):
+    reset_from(1); show_only(0)
+
+def back_to_farm(_):
+    reset_from(2); show_only(1)
+
+def back_to_factory(_):
+    reset_from(3); show_only(2)
+
+def back_to_dist(_):
+    reset_from(4); show_only(3)
+
+def finish(_):
+    if not any(b.value for b in store_boxes):
+        warn_store.value = "<span style='color:red'>체크하지 않았습니다.</span>"
+        return
+    selected = {
+        "1. 농장": [b.description.split(" (")[0] for b in farm_boxes if b.value],
+        "2. 공장": [b.description.split(" (")[0] for b in factory_boxes if b.value],
+        "3. 유통": [dist_kind.value] if dist_kind.value else [],
+        "4. 매장": [b.description.split(" (")[0] for b in store_boxes if b.value],
+    }
+    kg_amount = to_kg(amount.value, amount_unit.value, pname.value)
+    coef, kg, total, bd = calc(selected, kg_amount)
+    rows = "".join([f"<tr><td>{s}</td><td>{t}</td><td>{ef}</td></tr>" for s,t,ef in bd])
+    out.value = f"""
+      <table border=1 cellpadding=4>
+        <tr><th>단계</th><th>선택</th><th>계수</th></tr>{rows}
+      </table>
+      <div><b>제품명:</b> {pname.value}</div>
+      <div><b>최종 배출계수:</b> {coef} kg CO₂e/kg</div>
+      <div><b>섭취량:</b> {kg} kg</div>
+      <div><b>총 배출량:</b> {total} kg CO₂e</div>
+    """
+
+# 이벤트 연결
+to_farm_btn.on_click(go_to_farm)
+to_factory_btn.on_click(to_factory)
+to_dist_btn.on_click(to_dist)
+to_store_btn.on_click(to_store)
+finish_btn.on_click(finish)
+
+back_from_farm.on_click(back_to_start)
+back_from_factory.on_click(back_to_farm)
+back_from_dist.on_click(back_to_factory)
+back_from_store.on_click(back_to_dist)
+
+# 초기 배지 표시
+update_badge_farm(); update_badge_factory(); update_badge_dist(); update_badge_store()
+show_only(0)
