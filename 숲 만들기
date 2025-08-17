@@ -1,0 +1,86 @@
+import ipywidgets as widgets
+from IPython.display import display, SVG, clear_output
+import random
+
+# --- (이전 코드의 계산 및 SVG 생성 함수는 그대로 사용) ---
+def calculate_forest_growth(last_month_co2, this_month_co2):
+    if last_month_co2 <= this_month_co2:
+        return []
+    reduction_kg = last_month_co2 - this_month_co2
+    reduction_percent = (reduction_kg / last_month_co2) * 100
+    trees_to_grow = []
+    num_small_trees = int(reduction_percent / 5)
+    for _ in range(num_small_trees):
+        trees_to_grow.append({'size': 'small', 'emoji': '🌲'})
+    num_big_trees = int(reduction_percent / 20)
+    if num_big_trees > 0:
+        trees_to_grow = trees_to_grow[num_big_trees * 4:]
+        for _ in range(num_big_trees):
+            trees_to_grow.append({'size': 'big', 'emoji': '🌳'})
+    return trees_to_grow
+
+def create_forest_svg(trees):
+    svg_elements = '<rect width="400" height="300" style="fill:skyblue" />'
+    svg_elements += '<rect y="250" width="400" height="50" style="fill:limegreen" />'
+    if not trees:
+        svg_elements += '<text x="100" y="150" font-size="20">탄소 절감에 성공하고<br/>나만의 숲을 가꿔보세요!</text>'
+    for i, tree in enumerate(trees):
+        random.seed(i)
+        if tree['size'] == 'big':
+            font_size, y_pos = 50, random.randint(200, 250)
+        else: # small
+            font_size, y_pos = 35, random.randint(220, 250)
+        x_pos = random.randint(10, 360)
+        svg_elements += f'<text x="{x_pos}" y="{y_pos}" font-size="{font_size}">{tree["emoji"]}</text>'
+    return f'<svg width="400" height="300" xmlns="http://www.w3.org/2000/svg">{svg_elements}</svg>'
+
+# --- 1. 사용자 입력을 위한 위젯(UI) 생성 ---
+last_month_input = widgets.FloatText(
+    value=15.5,
+    description='지난달 배출량(kg):',
+    style={'description_width': 'initial'}
+)
+this_month_input = widgets.FloatText(
+    value=10.2,
+    description='이번 달 배출량(kg):',
+    style={'description_width': 'initial'}
+)
+run_button = widgets.Button(
+    description="🌳 숲 생성하기",
+    button_style='success'
+)
+output_area = widgets.Output() # 결과가 표시될 영역
+
+# --- 2. 버튼 클릭 시 실행될 함수 정의 ---
+def on_run_button_clicked(b):
+    # [수정] 함수 안에서 필요한 모듈을 다시 임포트합니다.
+    from IPython.display import SVG, display, clear_output
+
+    # 출력 영역을 깨끗하게 지웁니다.
+    with output_area:
+        clear_output(wait=True)
+
+        # 1. 입력칸에서 현재 값 가져오기
+        last_month_co2 = last_month_input.value
+        this_month_co2 = this_month_input.value
+        
+        # 2. 가져온 값으로 계산 및 SVG 생성 실행
+        print(f"입력값: 지난달 {last_month_co2} kg, 이번 달 {this_month_co2} kg")
+        reduction = last_month_co2 - this_month_co2
+        if reduction > 0:
+            print(f"✅ 탄소 절감량: {reduction:.2f} kg CO₂e ({(reduction/last_month_co2*100):.1f}% 감소)")
+        else:
+            print("❌ 이번 달에는 탄소를 절감하지 못했어요.")
+
+        trees = calculate_forest_growth(last_month_co2, this_month_co2)
+        forest_image_svg = create_forest_svg(trees)
+
+        # 3. 결과 이미지 표시
+        print("\n--- 이번 달 나의 숲 ---")
+        display(SVG(forest_image_svg))
+
+# --- 3. 버튼과 함수 연결 및 UI 표시 ---
+run_button.on_click(on_run_button_clicked)
+
+print("월간 탄소 배출량(kg CO₂e)을 입력하고 버튼을 눌러주세요.")
+display(last_month_input, this_month_input, run_button, output_area)
