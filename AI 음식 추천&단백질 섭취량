@@ -1,0 +1,392 @@
+# ===== Colab Dashboard (엑셀 DB · 하루 기준 · AI 추천 카드 포함) =====
+# 설치
+!pip -q install plotly ipywidgets pandas numpy openpyxl xlrd==2.0.1
+
+import re, io, datetime as dt, os, numpy as np, pandas as pd
+import ipywidgets as W
+from IPython.display import display, clear_output
+from google.colab import files
+
+# 공통 유틸
+def to_ts(d): return pd.Timestamp(d).normalize()
+TODAY_TS = to_ts(dt.date.today())
+
+# 업로더/버튼
+uploader = W.FileUpload(accept=".xlsx,.xls", multiple=True, description="엑셀 업로드(선택)")
+load_btn = W.Button(description="데이터 불러오기", button_style="primary")
+load_out = W.Output()
+
+# 기본 파일(없어도 됨)
+DEFAULT_FILES = [
+    "/mnt/data/20250408_음식DB.xlsx",
+    "/mnt/data/20241230_가공식품DB_133569건.xlsx",
+    "/mnt/data/전국통합식품영양성분정보_원재료성식품_표준데이터-20250815.xls",
+]
+
+# 엑셀 읽기: 확장자별 엔진 자동
+def read_excel_any(path_or_bytes, filename=None):
+    # Ensure filename is a string before processing
+    filename_str = str(filename) if filename is not None else ""
+
+    if isinstance(path_or_bytes, (str, os.PathLike)):
+        ext = os.path.splitext(str(path_or_bytes))[1].lower()
+    else:
+        # Use the string version of filename here
+        ext = os.path.splitext(filename_str or "")[1].lower()
+    engine = "xlrd" if ext == ".xls" else "openpyxl"
+    xls = pd.ExcelFile(path_or_bytes, engine=engine)
+    df = pd.read_excel(xls, sheet_name=xls.sheet_names[0], engine=engine)
+    return df
+
+# DB 병합 로딩
+def build_food_db():
+    dfs = []
+    # 업로드 파일 우선
+    if uploader.value:
+        for _, meta in uploader.value.items():
+            content = meta["content"]; fname = meta["metadata"]["name"]
+            try:
+                dfs.append(read_excel_any(io.BytesIO(content), filename=fname))
+            except Exception as e:
+                print(f"업로드 파일 읽기 실패: {fname} -> {e}")
+    # 업로드 없으면 기본 경로
+    if not dfs:
+        for fname in DEFAULT_FILES:
+            if os.path.exists(fname):
+                try:
+                    dfs.append(read_excel_any(fname, filename=fname))
+                except Exception as e:
+                    print(f"기본 파일 읽기 실패: {fname} -> {e}")
+    if not dfs:
+        raise RuntimeError("엑셀을 찾을 수 없습니다.")
+    dfs = [d for d in dfs if isinstance(d, pd.DataFrame) and not d.empty]
+    if not dfs:
+        raise RuntimeError("엑셀 내용이 비어 있습니다.")
+    return pd.concat(dfs, ignore_index=True)
+
+# 정규화: 이름/기준량/열량 -> per100, 탄소 추정(+선택: 단백질)
+def normalize_food_table(df_raw):
+    df = df_raw.copy()
+    df.rename(columns={c: str(c).strip() for c in df.columns}, inplace=True)
+
+    name_col = next((c for c in df.columns if ("식품명" in c) or ("제품명" in c) or ("품명" in c)), None)
+    unit_col = next((c for c in df.columns if ("영양성분함량기준량" in c) or ("기준" in c) or ("단위" in c) or ("1회제공량" in c)), None)
+    kcal_col = next((c for c in df.columns if (("에너지" in c) and ("kcal" in c)) or ("kcal" in c.lower()) or ("열량" in c)), None)
+    prot_col = next((c for c in df.columns if ("단백질" in c) and ("g" in c)), None)  # 선택
+
+    if not all([name_col, unit_col, kcal_col]):
+        raise ValueError(f"필요 컬럼 없음(식품명/기준량/kcal). 예시: {list(df.columns)[:12]}")
+
+    def parse_unit(s):
+        s = str(s)
+        m = re.search(r'([\d\.]+)\s*(g|그람|ml|mL|밀리리터)', s)
+        if m:
+            amt = float(m.group(1))
+            u = m.group(2)
+            unit = "ml" if u.lower() in ["ml","mL","밀리리터"] else "g"
+            return amt, unit
+        return 100.0, "g"
+
+    parsed = df[unit_col].apply(parse_unit)
+    df["base_amount"] = parsed.apply(lambda x: x[0])
+    df["base_unit"]   = parsed.apply(lambda x: x[1])
+
+    df["kcal_per1"] = pd.to_numeric(df[kcal_col], errors="coerce") / df["base_amount"]
+    if prot_col:
+        df["protein_per1"] = pd.to_numeric(df[prot_col], errors="coerce") / df["base_amount"]
+
+    keep = [name_col, "base_unit", "kcal_per1"] + (["protein_per1"] if "protein_per1" in df.columns else [])
+    out = df[keep].rename(columns={name_col: "식품명"})
+    out = (out
+           .dropna(subset=["식품명","kcal_per1"])
+           .groupby(["식품명","base_unit"], as_index=False)
+           .mean(numeric_only=True))
+
+    out["per100"] = (out["kcal_per1"] * 100).round(1)
+    out["carbon_per100_gCO2"] = (out["per100"] * 0.5).round(1)
+    if "protein_per1" in out.columns:
+        out["protein_per100"] = (out["protein_per1"] * 100).round(1)
+    return out
+
+FOOD_DB = None
+
+def load_data(_=None):
+    global FOOD_DB
+    with load_out:
+        clear_output(wait=True); print("엑셀 로딩/정규화 중…")
+    try:
+        raw = build_food_db()
+        FOOD_DB = normalize_food_table(raw)
+        if FOOD_DB is None or FOOD_DB.empty:
+            raise RuntimeError("정규화 결과가 비어 있습니다. 컬럼명을 확인하세요.")
+        with load_out:
+            clear_output(wait=True)
+            cnt = len(FOOD_DB)
+            dist = FOOD_DB["base_unit"].value_counts().to_dict()
+            print(f"로드 완료: 총 {cnt}개 식품 (단위 분포: {dist})")
+        # 활성화
+        search_btn.disabled = False
+        search_results.disabled = False
+    except Exception as e:
+        FOOD_DB = None
+        with load_out:
+            clear_output(wait=True)
+            print("❌ 음식DB 로드 실패:", e)
+            print("- 업로드 파일의 첫 시트에 데이터가 있는지")
+            print("- 필수 컬럼(식품명/기준량/에너지[kcal]) 존재 여부")
+            print("- .xls/.xlsx 확장자와 엔진 매칭 확인")
+    render()
+load_btn.on_click(load_data)
+
+# TDEE
+def calc_tdee(age, sex, height_cm, weight_kg, activity):
+    if sex == "남": bmr = 10*weight_kg + 6.25*height_cm - 5*age + 5
+    else: bmr = 10*weight_kg + 6.25*height_cm - 5*age - 161
+    factor = {"거의 운동 안함":1.2, "가벼운 운동":1.375, "보통 운동":1.55, "강한 운동":1.725, "아주 강함":1.9}[activity]
+    return round(bmr*factor, 0)
+
+age = W.Dropdown(description="나이", options=[(f"{y}세", y) for y in range(10, 81)], value=25)
+height = W.Dropdown(description="키", options=[(f"{h} cm", h) for h in range(140, 201)], value=170)
+weight = W.Dropdown(description="몸무게", options=[(f"{w} kg", w) for w in range(35, 121)], value=65)
+sex = W.ToggleButtons(description="성별", options=["남","여"], value="남")
+activity = W.Dropdown(description="활동지수", options=["거의 운동 안함","가벼운 운동","보통 운동","강한 운동","아주 강함"], value="보통 운동")
+calc_btn = W.Button(description="권장 칼로리 계산", button_style="primary")
+tdee_out = W.HTML("<b>권장 칼로리: 2000 kcal</b>")
+def on_calc_clicked(_):
+    tdee = calc_tdee(age.value, sex.value, height.value, weight.value, activity.value)
+    tdee_out.value = f"<b>권장 칼로리: {tdee:.0f} kcal</b>"
+    render()
+calc_btn.on_click(on_calc_clicked)
+
+# 검색/선택/추가
+food_search = W.Text(description="음식 검색", placeholder="예) 닭가슴살, 라면, 우유 …")
+search_btn = W.Button(description="검색", button_style="info", icon="search"); search_btn.disabled = True
+search_results= W.Select(options=[], rows=8, description="검색결과"); search_results.disabled = True
+kcal_info = W.HTML("")
+amount = W.FloatText(description="양", value=200.0)
+amount_unit = W.Dropdown(description="단위", options=["g","ml"], value="g")
+meal_cat = W.Dropdown(options=["아침","점심","저녁","간식"], description="구분")
+add_btn = W.Button(description="섭취 추가", button_style="success")
+add_out = W.HTML("")
+
+# AI 카드
+recommend_out = W.HTML("")   # 필수(추천)
+protein_out   = W.HTML("")   # 선택(단백질 알림)
+
+# 추천 로직
+def get_recommendation(food_name, food_unit, db):
+    original = db[(db["식품명"] == food_name) & (db["base_unit"] == food_unit)]
+    if original.empty:
+        return "<span style='color:#888'>선택 항목을 DB에서 찾지 못했어요.</span>"
+    orig_kcal = float(original.iloc[0]["per100"])
+    # Corrected: Use .loc for label-based indexing
+    orig_co2  = float(original.loc[original.index[0], "carbon_per100_gCO2"])
+    candidates = db[(db["per100"] < orig_kcal) & (db["carbon_per100_gCO2"] < orig_co2)].copy()
+    if candidates.empty:
+        return "<span style='color:#888'>💡 더 나은 대안을 찾지 못했어요.</span>"
+    candidates["score"] = (orig_kcal - candidates["per100"]) + 10.0*(orig_co2 - candidates["carbon_per100_gCO2"])
+    top = candidates.sort_values(["score","per100","carbon_per100_gCO2"], ascending=[False,True,True]).head(3)
+    best = top.iloc[0]
+    kcal_reduc_pct = max(0.0, 100.0 * (orig_kcal - best["per100"]) / max(1e-6, orig_kcal))
+    co2_reduc_pct  = max(0.0, 100.0 * (orig_co2  - best["carbon_per100_gCO2"]) / max(1e-6, orig_co2))
+    alt = f" 대안: {top.iloc[1]['식품명']}" if len(top) >= 2 else ""
+    return (f"💡 <b>AI 추천</b> — <b>{best['식품명']}</b> 어떠세요? "
+            f"칼로리 <b>{kcal_reduc_pct:.0f}%↓</b>, 탄소 <b>{co2_reduc_pct:.0f}%↓</b> 가능해요."
+            f"<span style='color:#666'>{alt}</span>")
+
+# 선택형: 단백질 힌트
+def protein_hint(weight_kg, log_df):
+    if "protein_g" not in log_df.columns or log_df["protein_g"].isna().all():
+        return "<span style='color:#888'>단백질 정보를 추정할 데이터가 없어요.</span>"
+    today = log_df[log_df["date"] == TODAY_TS]
+    target = 1.6 * float(weight_kg)
+    cur = float(today["protein_g"].sum())
+    if cur < 0.6 * target: msg = "오늘 단백질이 부족합니다."
+    elif cur < target:     msg = "조금만 더 섭취하면 목표에 도달해요."
+    else:                  msg = "오늘 단백질 목표를 달성했어요!"
+    return f"🍗 {msg} ({cur:.0f}g / 목표 {target:.0f}g)"
+
+# 검색
+def run_search(_=None):
+    global FOOD_DB
+    if FOOD_DB is None or not isinstance(FOOD_DB, pd.DataFrame) or FOOD_DB.empty:
+        kcal_info.value = "<span style='color:red'>먼저 위에서 엑셀 데이터를 불러오세요.</span>"
+        search_results.options = []; return
+    q = food_search.value.strip()
+    if not q:
+        search_results.options = []; kcal_info.value = ""; return
+    mask = FOOD_DB["식품명"].str.contains(re.escape(q), case=False, na=False)
+    result = FOOD_DB.loc[mask, ["식품명","base_unit","per100"]].copy()
+    result["label"] = result["식품명"] + " (" + result["base_unit"] + ") — " + result["per100"].round(1).astype(str) + " kcal/100"
+    search_results.options = list(result["label"]) if not result.empty else ["(검색 결과 없음)"]
+    kcal_info.value = ""
+search_btn.on_click(run_search)
+food_search.observe(lambda _ : run_search(), names="value")
+
+# 선택 변경
+def on_select_change(change):
+    global FOOD_DB
+    if FOOD_DB is None or not isinstance(FOOD_DB, pd.DataFrame) or FOOD_DB.empty:
+        kcal_info.value = "<span style='color:red'>먼저 음식DB를 불러오세요.</span>"
+        recommend_out.value = ""; protein_out.value = ""; return
+    sel = change["new"] or ""
+    if not sel or sel.startswith("("):
+        kcal_info.value = ""; recommend_out.value = ""; protein_out.value = ""; return
+    m = re.match(r'(.+?) \((g|ml)\)\s—\s', sel)
+    if not m:
+        kcal_info.value = ""; recommend_out.value = ""; protein_out.value = ""; return
+    name, unit = m.group(1), m.group(2)
+
+    row_sel = FOOD_DB[(FOOD_DB["식품명"] == name) & (FOOD_DB["base_unit"] == unit)]
+    if row_sel.empty:
+        kcal_info.value = "<span style='color:red'>선택 항목을 DB에서 찾을 수 없습니다.</span>"
+        recommend_out.value = ""; protein_out.value = ""; return
+
+    r = row_sel.iloc[0]
+    per100 = float(r["per100"])
+    kcal_info.value = f"<span style='color:#666'>선택: <b>{name}</b> [{unit}] — {per100:.1f} kcal / 100{unit}</span>"
+    amount_unit.value = unit
+
+    # 추천 카드
+    recommendation_text = get_recommendation(name, unit, FOOD_DB)
+    recommend_out.value = (
+        "<div style='margin-top:8px;padding:10px;border-radius:8px;"
+        "background:#F1F8FF;border:1px solid #D6E8FF'>"
+        f"{recommendation_text}"
+        "</div>"
+    )
+    # 선택: 단백질 카드
+    protein_text = protein_hint(weight.value, LOG if "protein_g" in LOG.columns else LOG.assign(protein_g=np.nan))
+    protein_out.value = (
+        "<div style='margin-top:8px;padding:10px;border-radius:8px;"
+        "background:#F7FBF2;border:1px solid #DDEFD3'>"
+        f"{protein_text}"
+        "</div>"
+    )
+search_results.observe(on_select_change, names="value")
+
+# 기록 LOG
+LOG = pd.DataFrame(columns=["date","category","food","amount","unit","kcal","co2_g"])
+def add_entry(_=None):
+    global LOG, FOOD_DB
+    if FOOD_DB is None or not isinstance(FOOD_DB, pd.DataFrame) or FOOD_DB.empty:
+        add_out.value = "<span style='color:red'>먼저 위에서 엑셀 데이터를 불러오세요.</span>"; return
+    sel = search_results.value if search_results.value else ""
+    m = re.match(r'(.+?) \((g|ml)\)\s—\s', sel or "")
+    if not m:
+        add_out.value = "<span style='color:red'>검색 후 결과에서 항목을 선택하세요.</span>"; return
+    name, base_unit = m.group(1), m.group(2)
+
+    row_sel = FOOD_DB[(FOOD_DB["식품명"] == name) & (FOOD_DB["base_unit"] == base_unit)]
+    if row_sel.empty:
+        add_out.value = "<span style='color:red'>선택 항목을 DB에서 찾을 수 없습니다.</span>"; return
+
+    r = row_sel.iloc[0]
+    kcal_per1      = float(r["kcal_per1"])
+    carbon_per100  = float(r["carbon_per100_gCO2"])
+    protein_per100 = float(r["protein_per100"]) if "protein_per100" in row_sel.columns else np.nan
+
+    amt = float(amount.value)
+    kcal = kcal_per1 * amt
+    co2g = carbon_per100 * (amt / 100.0)
+    protein_g = protein_per100 * (amt / 100.0) if not np.isnan(protein_per100) else np.nan
+
+    new_row = {"date": TODAY_TS, "category": meal_cat.value, "food": name,
+               "amount": round(amt,1), "unit": amount_unit.value,
+               "kcal": round(kcal,1), "co2_g": round(co2g,1)}
+    if not np.isnan(protein_g):
+        new_row["protein_g"] = round(protein_g,1)
+
+    LOG = pd.concat([LOG, pd.DataFrame([new_row])], ignore_index=True)
+    add_out.value = (f"<span style='color:green'>추가됨: <b>{name}</b> {amt}{amount_unit.value} → "
+                     f"{kcal:.0f} kcal, {co2g:.1f} g CO₂ ({meal_cat.value})</span>")
+    render()
+add_btn.on_click(add_entry)
+
+# CSV 저장
+download_btn = W.Button(description="CSV 다운로드(오늘)")
+def download_csv(_):
+    if LOG.empty:
+        with status_out: clear_output(); print("다운로드할 데이터가 없습니다."); return
+    fname = "섭취기록_오늘.csv"
+    LOG.sort_values("date").to_csv(fname, index=False)
+    files.download(fname)
+download_btn.on_click(download_csv)
+
+status_out = W.Output()
+summary_box= W.HTML("")
+table_out  = W.Output()
+
+def render():
+    if LOG.empty:
+        total_kcal, total_co2g = 0.0, 0.0
+        tbl = pd.DataFrame(columns=["시간","구분","식품","양","단위","kcal","CO₂(g)"])
+    else:
+        dff = LOG[LOG["date"] == TODAY_TS].copy()
+        total_kcal = float(dff["kcal"].sum())
+        total_co2g = float(dff["co2_g"].sum())
+        tbl = dff.rename(columns={"category":"구분","food":"식품","amount":"양","unit":"단위","co2_g":"CO₂(g)"})
+        tbl["시간"] = "오늘"
+        tbl = tbl[["시간","구분","식품","양","단위","kcal","CO₂(g)"]]
+
+    try:
+        goal = float(re.sub(r"[^0-9\.]", "", tdee_out.value)) or 2000.0
+    except Exception:
+        goal = 2000.0
+    pct = 0.0 if goal <= 0 else round(100.0 * total_kcal / goal, 1)
+    summary_box.value = f"""
+    <div style="display:flex;gap:16px;flex-wrap:wrap">
+      <div style="flex:1 1 260px;border:1px solid #eee;border-radius:8px;padding:12px;">
+        <div style="font-size:13px;color:#666">권장 칼로리(TDEE)</div>
+        <div style="font-size:20px;font-weight:700">{goal:.0f} kcal</div>
+      </div>
+      <div style="flex:1 1 260px;border:1px solid #eee;border-radius:8px;padding:12px;">
+        <div style="font-size:13px;color:#666">오늘 섭취 칼로리(누적)</div>
+        <div style="font-size:20px;font-weight:700">{total_kcal:.0f} kcal
+          <span style="font-size:12px;color:#888">({pct}% of TDEE)</span>
+        </div>
+      </div>
+      <div style="flex:1 1 260px;border:1px solid #eee;border-radius:8px;padding:12px;">
+        <div style="font-size:13px;color:#666">오늘 탄소배출량(누적)</div>
+        <div style="font-size:20px;font-weight:700">{(total_co2g/1000):.3f} kg CO₂e</div>
+      </div>
+    </div>
+    """
+    with table_out:
+        clear_output(wait=True)
+        if tbl.empty:
+            print("표시할 데이터가 없습니다.")
+        else:
+            tbl2 = tbl.copy(); tbl2["kcal"] = tbl2["kcal"].round(0).astype(int)
+            tbl2["CO₂(g)"] = tbl2["CO₂(g)"].round(1)
+            display(tbl2.reset_index(drop=True))
+    with status_out:
+        clear_output(wait=True); print("✅ 오늘 기준 요약 갱신 완료")
+
+# UI
+ui = W.VBox([
+    W.HTML("<h2>팀원 B/C — 하루 요약 및 AI 추천 대시보드</h2>"),
+    W.HTML("• 엑셀을 업로드하거나, 같은 폴더에 3개 파일을 두고 '데이터 불러오기'를 누르세요."),
+    W.HBox([uploader, load_btn]), load_out,
+    W.HTML("<hr>"),
+    W.HTML("<b>① 권장 칼로리 계산</b>"),
+    W.HBox([age, sex]), W.HBox([height, weight]), activity, W.HBox([calc_btn, tdee_out]),
+    W.HTML("<hr>"),
+    W.HTML("<b>② 음식 검색/추가 (엑셀 DB 기반)</b>"),
+    W.HBox([food_search, search_btn]),
+    W.HBox([search_results, kcal_info]),
+    W.HBox([amount, amount_unit, meal_cat, add_btn]), add_out,
+    W.HTML("<hr>"),
+    W.HTML("<b>③ AI 음식 추천</b>"),
+    recommend_out,
+    protein_out,  # 선택
+    W.HTML("<hr>"),
+    W.HTML("<b>④ 오늘 요약</b>"),
+    summary_box,
+    W.HTML("<b>⑤ 오늘 섭취 내역</b>"),
+    table_out,
+    W.HBox([download_btn]),
+    status_out
+])
+display(ui)
+render()
