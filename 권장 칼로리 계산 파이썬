@@ -1,0 +1,44 @@
+# ====== Mini TDEE Only (만나이/확장 범위) ======
+import ipywidgets as W
+from IPython.display import display, clear_output
+import pandas as pd
+import numpy as np
+
+# TDEE 계산 함수
+def calc_tdee(age, sex, height_cm, weight_kg, activity):
+    if sex == "남":
+        bmr = 10*weight_kg + 6.25*height_cm - 5*age + 5
+    else:
+        bmr = 10*weight_kg + 6.25*height_cm - 5*age - 161
+    factor = {"거의 운동 안함":1.2, "가벼운 운동":1.375, "보통 운동":1.55,
+              "강한 운동":1.725, "아주 강함":1.9}[activity]
+    return round(bmr*factor, 0)
+
+# 위젯 (만나이/키/몸무게 확장 범위)
+age = W.Dropdown(description="만나이", options=[(f"{y}세", y) for y in range(0, 201)], value=25)
+height = W.Dropdown(description="키", options=[(f"{h} cm", h) for h in range(0, 251)], value=170)
+weight = W.Dropdown(description="몸무게", options=[(f"{w} kg", w) for w in range(0, 201)], value=65)
+sex = W.ToggleButtons(description="성별", options=["남","여"], value="남")
+activity = W.Dropdown(description="활동지수",
+                      options=["거의 운동 안함","가벼운 운동","보통 운동","강한 운동","아주 강함"],
+                      value="보통 운동")
+
+calc_btn = W.Button(description="권장 칼로리 계산", button_style="primary")
+tdee_out = W.HTML("<b>권장 칼로리: 2000 kcal</b>")
+
+def on_calc_clicked(_):
+    tdee = calc_tdee(age.value, sex.value, height.value, weight.value, activity.value)
+    tdee_out.value = f"<b>권장 칼로리: {tdee:.0f} kcal</b>"
+
+calc_btn.on_click(on_calc_clicked)
+
+# 레이아웃 (이 부분만 표시)
+row1 = W.HBox([age, sex])
+row2 = W.HBox([height, weight])
+row3 = activity
+row4 = W.HBox([calc_btn, tdee_out])
+
+display(W.VBox([
+    W.HTML("<h2>권장 칼로리(TDEE) 계산</h2>"),
+    row1, row2, row3, row4
+]))
