@@ -22,7 +22,7 @@ def create_forest_svg(trees):
     svg_elements = '<rect width="400" height="300" style="fill:skyblue" />'
     svg_elements += '<rect y="250" width="400" height="50" style="fill:limegreen" />'
     if not trees:
-        svg_elements += '<text x="100" y="150" font-size="20">탄소 절감 화이팅 <br/>나만의 숲을 가꿔보세요!</text>'
+        svg_elements += '<text x="100" y="150" font-size="20">탄소 저감 화이팅 <br/>나만의 숲을 가꿔보세요!</text>'
     for i, tree in enumerate(trees):
         random.seed(i)
         if tree['size'] == 'big':
