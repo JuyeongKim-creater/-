@@ -5,7 +5,7 @@ import random
 # --- (계산 및 SVG 생성 함수는 이전과 동일) ---
 def calculate_forest_growth(last_month_co2, this_month_co2):
     reduction_kg = last_month_co2 - this_month_co2
-    # 이 함수는 절감량이 양수일 때만 호출될 것이므로, 음수 체크는 생략 가능
+    # 이 함수는 저감량이 양수일 때만 호출될 것이므로, 음수 체크는 생략 가능
     reduction_percent = (reduction_kg / last_month_co2) * 100
     trees_to_grow = []
     num_small_trees = int(reduction_percent / 5)
@@ -61,11 +61,11 @@ def on_run_button_clicked(b):
         
         print(f"입력값: 지난달 {last_month_co2} kg, 이번 달 {this_month_co2} kg")
         
-        # [수정] 절감량 조건에 따라 다른 로직을 실행하도록 변경
+        # [수정] 저감량 조건에 따라 다른 로직을 실행하도록 변경
         if last_month_co2 > this_month_co2:
-            # --- 1. 탄소를 절감했을 경우 ---
+            # --- 1. 탄소를 저감했을 경우 ---
             reduction = last_month_co2 - this_month_co2
-            print(f"✅ 탄소 절감량: {reduction:.2f} kg CO₂e ({(reduction/last_month_co2*100):.1f}% 감소)")
+            print(f"✅ 탄소 저감량: {reduction:.2f} kg CO₂e ({(reduction/last_month_co2*100):.1f}% 감소)")
 
             trees = calculate_forest_growth(last_month_co2, this_month_co2)
             forest_image_svg = create_forest_svg(trees)
@@ -74,8 +74,8 @@ def on_run_button_clicked(b):
             display(SVG(forest_image_svg))
         
         else:
-            # --- 2. 탄소를 절감하지 못했을 경우 ---
-            print("❌ 이번 달에는 탄소를 절감하지 못했어요.")
+            # --- 2. 탄소를 저감하지 못했을 경우 ---
+            print("❌ 이번 달에는 탄소를 저감하지 못했어요.")
             
             # 나무가 없는 빈 숲 이미지를 표시
             empty_forest_svg = create_forest_svg([])
