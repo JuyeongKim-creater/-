@@ -1,0 +1,286 @@
+# ===================== Colab: 2025-08 식단 달력 (xls 에러 고정, 제외목록 반영, 2000~2500 kcal) =====================
+import sys, subprocess, importlib, os, io, re, calendar, random
+from datetime import date
+from IPython.display import display, HTML
+
+# -------- 0) .xls 지원 환경 확정: pandas==1.5.3 + xlrd==1.2.0 --------
+def ensure_legacy_xls_support():
+    """
+    - pandas 2.x 는 xlrd 2.x를 요구하지만 .xls는 지원하지 않음
+    - Colab에서 .xls를 안정적으로 읽기 위해 pandas==1.5.3 + xlrd==1.2.0 고정
+    """
+    need_fix = False
+    try:
+        import pandas as pd
+        pv_major = int(pd.__version__.split(".")[0])
+        if pv_major >= 2:
+            need_fix = True
+    except Exception:
+        need_fix = True
+
+    try:
+        import xlrd
+        xv_major = int(xlrd.__version__.split(".")[0])
+        if xv_major >= 2:  # 2.x는 .xls 미지원
+            need_fix = True
+    except Exception:
+        need_fix = True
+
+    if need_fix:
+        print("🔧 .xls 지원을 위해 pandas==1.5.3, xlrd==1.2.0으로 재설치합니다...")
+        subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "pandas", "xlrd"], check=False)
+        subprocess.run([sys.executable, "-m", "pip", "install", "--no-cache-dir",
+                        "pandas==1.5.3", "xlrd==1.2.0", "openpyxl", "numpy", "ipywidgets"], check=True)
+        importlib.invalidate_caches()
+        print("✅ 설치 정비 완료.")
+
+ensure_legacy_xls_support()
+
+import numpy as np
+import pandas as pd
+from google.colab import files
+
+# -------- 1) 사용자 업로드(선택) + 기본 경로 --------
+print("엑셀을 업로드하려면 팝업에서 '원재료.xls / 가공식품.xlsx / 요리.xlsx'를 선택하세요. (건너뛰면 /mnt/data 파일 사용)")
+try:
+    uploaded = files.upload()  # 업로드는 선택 사항
+    UP_FILES = list(uploaded.keys())
+except Exception:
+    UP_FILES = []
+
+DEFAULT_FILES = [
+    "/mnt/data/원재료.xls",
+    "/mnt/data/가공식품.xlsx",
+    "/mnt/data/요리.xlsx",
+    # 여분(한글 조합 이슈 대비)
+    "/mnt/data/원재료.xls",
+    "/mnt/data/가공식품.xlsx",
+    "/mnt/data/요리.xlsx",
+]
+
+def _read_excel_any(local_path: str) -> pd.DataFrame:
+    """
+    확장자별 엔진을 명시적으로 사용하고, 실패 시 엔진 자동 재시도.
+    """
+    ext = os.path.splitext(local_path)[1].lower()
+    try:
+        if ext == ".xls":
+            xls = pd.ExcelFile(local_path, engine="xlrd")
+            return pd.read_excel(xls, sheet_name=xls.sheet_names[0], engine="xlrd")
+        else:  # .xlsx
+            xls = pd.ExcelFile(local_path, engine="openpyxl")
+            return pd.read_excel(xls, sheet_name=xls.sheet_names[0], engine="openpyxl")
+    except Exception as e1:
+        try:
+            xls = pd.ExcelFile(local_path)
+            return pd.read_excel(xls, sheet_name=xls.sheet_names[0])
+        except Exception as e2:
+            raise RuntimeError(f"파일 읽기 실패: {local_path}\n - 1차:{e1}\n - 2차:{e2}")
+
+def load_sources() -> pd.DataFrame:
+    dfs = []
+    # 1) 업로드 우선
+    for p in UP_FILES:
+        try:
+            df = _read_excel_any(p)
+            df.columns = [str(c).strip() for c in df.columns]
+            if not df.empty: dfs.append(df)
+            else: print(f"⚠ 빈 시트 건너뜀: {p}")
+        except Exception as e:
+            print(f"⚠ 파일 읽기 실패: {p} -> {e}")
+    # 2) 기본 경로
+    if not dfs:
+        for p in DEFAULT_FILES:
+            if os.path.exists(p):
+                try:
+                    df = _read_excel_any(p)
+                    df.columns = [str(c).strip() for c in df.columns]
+                    if not df.empty: dfs.append(df)
+                    else: print(f"⚠ 빈 시트 건누뜀: {p}")
+                except Exception as e:
+                    print(f"⚠ 파일 읽기 실패: {p} -> {e}")
+    if not dfs:
+        raise RuntimeError("엑셀을 찾지 못했습니다. /mnt/data 경로에 '원재료.xls, 가공식품.xlsx, 요리.xlsx' 중 하나 이상을 두거나 업로드하세요.")
+    return pd.concat(dfs, ignore_index=True, sort=False)
+
+# -------- 2) 표준화(식품명/단위/kcal) --------
+def normalize_food_table(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    결과 컬럼: 식품명, base_unit(g/ml), kcal_per1, per100, is_dish
+    """
+    df = df_raw.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    name_col = next((c for c in df.columns if any(k in c for k in ["식품명","제품명","품명","메뉴","food","name"])), None)
+    unit_col = next((c for c in df.columns if any(k in c for k in ["영양성분함량기준량","기준","단위","1회제공량","serving"])), None)
+    kcal_col = next((c for c in df.columns if ("kcal" in c.lower()) or ("열량" in c)), None)
+
+    # 최소 보정
+    if name_col is None: name_col = df.columns[0]
+    if unit_col is None: unit_col = df.columns[1] if len(df.columns) > 1 else df.columns[0]
+    if kcal_col is None:
+        num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        if num_cols: kcal_col = num_cols[0]
+        else: raise ValueError(f"필요 열(식품명/단위/kcal) 추출 실패. 현재 열: {list(df.columns)[:10]} ...")
+
+    def parse_unit(s):
+        s = "" if pd.isna(s) else str(s)
+        m = re.search(r'([\d\.]+)\s*(g|ml|mL|G|ML)', s)
+        if m:
+            amt = float(m.group(1))
+            unit = "ml" if "ml" in m.group(2).lower() else "g"
+            return amt, unit
+        m2 = re.search(r'1\s*회.*?([\d\.]+)\s*(g|ml)', s)
+        if m2:
+            return float(m2.group(1)), m2.group(2).lower()
+        return 100.0, "g"
+
+    parsed = df[unit_col].apply(parse_unit)
+    df["base_amount"] = parsed.apply(lambda x: x[0])
+    df["base_unit"]   = parsed.apply(lambda x: x[1])
+    df["kcal_per1"]   = pd.to_numeric(df[kcal_col], errors="coerce") / df["base_amount"]
+
+    out = df[[name_col, "base_unit", "kcal_per1"]].rename(columns={name_col:"식품명"})
+    out = out.dropna(subset=["식품명","kcal_per1"])
+    out = out.groupby(["식품명","base_unit"], as_index=False)["kcal_per1"].mean()
+    out["per100"] = (out["kcal_per1"] * 100).round(1)
+
+    # '한 끼 음식' 우선 선정을 위한 키워드
+    dish_kw = ["국","탕","찌개","덮밥","볶음밥","비빔밥","파스타","라면","우동","칼국수","냉면","짜장","짬뽕",
+               "비빔국수","국수","만두","돈까스","카레","리조또","김치볶음밥","김밥","부대찌개","설렁탕","순댓국",
+               "감자탕","삼계탕","갈비탕","갈비찜","찜","찜닭","제육볶음","치킨","버거","피자","스테이크","샐러드"]
+    out["is_dish"] = out["식품명"].astype(str).apply(lambda x: any(k in x for k in dish_kw))
+    return out.reset_index(drop=True)
+
+# -------- 3) 제외할 식품(요청 목록) --------
+EXCLUDE_NAMES = [
+    "SJ모짜렐라피자치즈", "국내산밀가루로만든또띠아", "유기농황설탕",
+    "피자_살치스테이크 피자 밀도우 (R)", "한마음 냉면육수", "시민냉면 생면",
+    "붐 스윗 피자치즈", "국밥용 수육", "JL 피자치즈",
+    "종로면선생들깨칼국수면", "밀언니의 귀리 파스타면", "산타솜사탕-화이트"
+]
+def apply_exclusion(pool: pd.DataFrame) -> pd.DataFrame:
+    names = set(n.lower() for n in EXCLUDE_NAMES)
+    def banned(x):
+        xx = str(x).lower()
+        # 정확도 높이기: 완전일치 or 포함(둘 다 걸러냄)
+        return any(xx == n or n in xx for n in names)
+    return pool[~pool["식품명"].astype(str).apply(banned)].reset_index(drop=True)
+
+# -------- 4) 1식 1메뉴 생성(2000~2500kcal 목표 충족) --------
+def _pick_one_dish(pool: pd.DataFrame, rng: random.Random, kcal_target: float):
+    cand = pool[(pool["per100"] > 0) & (pool["per100"] < 900)].copy()
+    if cand.empty: return None
+    dish = cand[cand["is_dish"]]
+    use = dish if not dish.empty else cand
+
+    row = use.sample(1, random_state=rng.randint(1, 10**9)).iloc[0]
+    name = str(row["식품명"]); unit = row["base_unit"]
+    per1 = float(row["kcal_per1"])  # 1 g/ml 당 kcal
+    if per1 <= 0 or np.isnan(per1): return None
+
+    amt = kcal_target / per1
+    if unit == "g":   amt = float(np.clip(amt, 200, 700))
+    else:             amt = float(np.clip(amt, 300, 1200))
+    amt *= rng.uniform(0.9, 1.1)
+
+    kcal = per1 * amt
+    return (name, round(amt), unit, round(kcal, 0))
+
+def build_day_meals(pool: pd.DataFrame, rng: random.Random):
+    for _ in range(12):
+        t_break = rng.uniform(600, 750)
+        t_lunch = rng.uniform(750, 900)
+        t_din   = rng.uniform(750, 900)
+
+        b = _pick_one_dish(pool, rng, t_break)
+        l = _pick_one_dish(pool, rng, t_lunch)
+        d = _pick_one_dish(pool, rng, t_din)
+        if any(x is None for x in [b, l, d]):  # 하나라도 실패하면 재시도
+            continue
+        total = b[3] + l[3] + d[3]
+        if 2000 <= total <= 2500:
+            return {"아침":[b], "점심":[l], "저녁":[d]}, total
+
+    # 근사치라도 반환
+    b = _pick_one_dish(pool, rng, 700)
+    l = _pick_one_dish(pool, rng, 850)
+    d = _pick_one_dish(pool, rng, 850)
+    if any(x is None for x in [b, l, d]):
+        return {"아침":[], "점심":[], "저녁":[]}, 0.0
+    return {"아침":[b], "점심":[l], "저녁":[d]}, (b[3]+l[3]+d[3])
+
+# -------- 5) 달력 생성 + 표기 --------
+def make_meal_calendar(year:int, month:int, seed:int=123, show=True):
+    raw = load_sources()
+    FOOD = normalize_food_table(raw)
+    FOOD = apply_exclusion(FOOD)  # 🔴 요청 제외 목록 반영
+
+    rng = random.Random(seed)
+    last_day = calendar.monthrange(year, month)[1]
+    days = [date(year, month, d) for d in range(1, last_day+1)]
+
+    plans = {}; rows = []
+    for d in days:
+        meals, total = build_day_meals(FOOD, rng)
+        b = int(sum(x[3] for x in meals["아침"]))
+        l = int(sum(x[3] for x in meals["점심"]))
+        dn = int(sum(x[3] for x in meals["저녁"]))
+        plans[d] = meals
+        rows.append({"date": pd.Timestamp(d),
+                     "kcal_total": int(total),
+                     "kcal_breakfast": b,
+                     "kcal_lunch": l,
+                     "kcal_dinner": dn})
+    df_month = pd.DataFrame(rows)
+
+    # 월 달력 HTML
+    cgrid = calendar.monthcalendar(year, month)
+    wk_names = ["일","월","화","수","목","금","토"]
+    month_name = f"{year}년 {month}월"
+
+    def cell_html(day_num):
+        if day_num == 0:
+            return "<td></td>"
+        d = pd.Timestamp(date(year, month, day_num))
+        row = df_month[df_month["date"]==d].iloc[0]
+        top = int(row["kcal_total"])
+        b = int(row["kcal_breakfast"]); l = int(row["kcal_lunch"]); dn = int(row["kcal_dinner"])
+        # 총 kcal 크게, 아래 줄 아침/점심/저녁 kcal
+        return f"""
+        <td style="vertical-align:top; width:120px; height:92px; padding:8px;">
+          <div style="font-weight:600; margin-bottom:4px;">{day_num}</div>
+          <div style="font-size:18px; font-weight:700;">{top}</div>
+          <div style="color:#666; font-size:12px;">{b}/{l}/{dn}</div>
+        </td>"""
+
+    html = f"""
+    <div style="font-size:20px; font-weight:700; margin:8px 0;">달력</div>
+    <div style="font-size:16px; margin-bottom:6px;">{month_name}</div>
+    <table border="0" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
+      <thead><tr>{"".join(f'<th style="width:120px; padding:6px; color:#666;">{w}</th>' for w in wk_names)}</tr></thead>
+      <tbody>
+    """
+    for week in cgrid:
+        html += "<tr>" + "".join(cell_html(dn) for dn in week) + "</tr>"
+    html += "</tbody></table>"
+
+    if show: display(HTML(html))
+    return df_month, plans, html
+
+# ===================== 실행: 2025년 8월 (1~31일 달력 + 상세 자동메뉴) =====================
+df_aug, plans_aug, cal_html = make_meal_calendar(2025, 8, seed=777, show=True)
+
+# 모든 날짜의 자동 구성 메뉴(메뉴명·양·kcal) 전체 출력
+def show_month_details(plans_dict, y, m):
+    last_day = calendar.monthrange(y, m)[1]
+    for d in range(1, last_day+1):
+        k = date(y, m, d)
+        meals = plans_dict.get(k, {})
+        print(f"\n[{y}-{m:02d}-{d:02d}] 자동 구성 메뉴")
+        for meal in ["아침","점심","저녁"]:
+            items = meals.get(meal, [])
+            line = " + ".join([f"{nm} {amt}{u}({int(kc)}kcal)" for nm,amt,u,kc in items]) or "-"
+            print(f"  · {meal}: {line}")
+
+show_month_details(plans_aug, 2025, 8)
