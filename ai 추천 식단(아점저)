@@ -1,0 +1,161 @@
+# 1. 라이브러리 설치 (Colab 최초 1회만 실행)
+!pip install ipywidgets pandas numpy openpyxl xlrd==2.0.1 --quiet
+
+# 2. 임포트
+import pandas as pd
+import numpy as np
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+from itertools import product
+import io
+import random
+
+# 3. 탄소배출량 DB 구성
+EMISSION_FACTORS = {
+    "1. 농장": {
+        "소고기": 48.0, "돼지고기": 5.5, "닭고기": 4.8,
+        "계란": 2.5, "유제품": 2.0, "쌀": 3.0, "과일": 0.4,
+        "채소": 0.2, "수산물(양식)": 3.5, "수산물(자연산)": 1.5
+    },
+    "2. 공장": {"가공": 0.4, "살균/멸균": 0.3, "포장": 0.2},
+    "3. 유통": {"국산": 0.1, "해상운송": 2.0, "항공운송": 25.0},
+    "4. 매장": {"냉장/냉동": 0.2, "조명 및 기타 에너지": 0.1, "식품 폐기": 0.2},
+}
+
+def get_carbon_tags(food_name):
+    tags = []
+    for stage, items in EMISSION_FACTORS.items():
+        for tag in items:
+            if tag in str(food_name):
+                tags.append((stage, tag))
+    if not any("유통" in stage for stage, _ in tags):
+        tags.append(("3. 유통", "국산"))
+    return tags
+
+def calculate_carbon_factor(tags):
+    return sum(EMISSION_FACTORS[stage].get(tag, 0) for stage, tag in tags)
+
+# 4. 사용자 권장 섭취량 계산
+def calculate_user_targets(gender, age, height, weight, activity_level='보통'):
+    if gender == '남성':
+        bmr = 10 * weight + 6.25 * height - 5 * age + 5
+    else:
+        bmr = 10 * weight + 6.25 * height - 5 * age - 161
+    factors = {'낮음': 1.375, '보통': 1.55, '높음': 1.725}
+    tdee = bmr * factors.get(activity_level, 1.55)
+    return {
+        'calories': tdee,
+        'carbs': (tdee * 0.4) / 4,
+        'protein': (tdee * 0.3) / 4,
+        'fat': (tdee * 0.3) / 9
+    }
+
+# 5. 파일 읽기 함수
+def read_any_table(file_name, file_content):
+    try:
+        return pd.read_excel(io.BytesIO(file_content))
+    except:
+        pass
+    for enc in ('cp949', 'utf-8-sig', 'utf-8'):
+        try:
+            return pd.read_csv(io.BytesIO(file_content), encoding=enc)
+        except:
+            continue
+    return pd.read_csv(io.BytesIO(file_content))
+
+# 6. AI 식단 추천 함수 (100g 식단 기준)
+def recommend_meal_plan(db, targets, seed=None):
+    db = db[db['carbon_g_per_100g'] <= 4000].copy()
+    meals = ['아침', '점심', '저녁']
+    samples = []
+
+    if seed is not None:
+        random.seed(seed)
+
+    for meal in meals:
+        candidates = db[db['meal_type'].str.contains(meal, na=False)]
+        if candidates.empty:
+            return f"{meal} 식단 후보가 부족합니다."
+        samples.append(candidates.sample(1))
+
+    plan_df = pd.concat(samples).reset_index(drop=True)
+    portion_g = 350  # 1인분 기준
+    nutrients = ['calories', 'carbs', 'protein', 'fat', 'carbon_g_per_100g']
+    plan_df[nutrients] = plan_df[nutrients].apply(lambda x: x * portion_g / 100)
+
+    total = plan_df[nutrients].sum()
+
+    return plan_df, total
+
+# 7. UI 위젯
+uploader = widgets.FileUpload(accept='.csv,.xlsx', multiple=False, description="DB 업로드")
+gender = widgets.Dropdown(options=['남성', '여성'], description='성별')
+age = widgets.IntSlider(value=25, min=10, max=80, description='나이')
+height = widgets.IntSlider(value=170, min=140, max=200, description='키(cm)')
+weight = widgets.IntSlider(value=65, min=30, max=150, description='체중(kg)')
+activity = widgets.Dropdown(options=['낮음', '보통', '높음'], description='활동량')
+
+run_button = widgets.Button(description='🍱 AI 식단 추천', button_style='success')
+refresh_button = widgets.Button(description='🔄 새로고침', button_style='info')
+output = widgets.Output()
+
+# 8. 메인 실행 함수
+def run_recommendation(_):
+    output.clear_output()
+    with output:
+        if not uploader.value:
+            print("❗ 식품 데이터 파일을 먼저 업로드하세요.")
+            return
+        content = list(uploader.value.values())[0]['content']
+        df = read_any_table("file", content)
+
+        rename_map = {
+            '식품명': 'food_name',
+            '에너지(kcal)': 'calories',
+            '에너지(㎉)': 'calories',
+            '탄수화물(g)': 'carbs',
+            '단백질(g)': 'protein',
+            '지방(g)': 'fat',
+            'meal_type': 'meal_type'
+        }
+        df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns}, inplace=True)
+        if 'food_name' not in df.columns:
+            print("❗ '식품명' 또는 'food_name' 컬럼이 필요합니다.")
+            return
+        df.drop_duplicates(subset=['food_name'], inplace=True)
+        for col in ['calories', 'carbs', 'protein', 'fat']:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+        df.fillna(0, inplace=True)
+        df['carbon_tags'] = df['food_name'].apply(get_carbon_tags)
+        df['carbon_factor'] = df['carbon_tags'].apply(calculate_carbon_factor)
+        df['carbon_g_per_100g'] = df['carbon_factor'] * 100
+
+        user_targets = calculate_user_targets(gender.value, age.value, height.value, weight.value, activity.value)
+        plan_df, total = recommend_meal_plan(df, user_targets, seed=np.random.randint(0, 100000))
+
+        print("👤 건강 & 저탄소 AI 식단 추천기")
+        print("📌 1인분 기준 섭취량: 350g\n")
+        for i, row in plan_df.iterrows():
+            emoji = ["☀️ 아침", "🌞 점심", "🌙 저녁"][i]
+            print(f"{emoji}: {row['food_name']}  ({int(350)}g, {row['carbon_g_per_100g']:.2f} g CO₂e)")
+
+        print("\n📊 총 섭취 요약")
+        print(f"  - 열량: {total['calories']:.0f} kcal")
+        print(f"  - 탄수화물: {total['carbs']:.0f} g")
+        print(f"  - 단백질: {total['protein']:.0f} g")
+        print(f"  - 지방: {total['fat']:.0f} g")
+        print(f"  - 탄소배출량: {total['carbon_g_per_100g'] / 1000:.2f} kg CO₂e")
+
+# 버튼 연결
+run_button.on_click(run_recommendation)
+refresh_button.on_click(run_recommendation)
+
+# 9. UI 출력
+ui = widgets.VBox([
+    widgets.HTML("<h3>🍀 건강 & 저탄소 AI 식단 추천기</h3>"),
+    uploader, gender, age, height, weight, activity,
+    widgets.HBox([run_button, refresh_button]),
+    output
+])
+display(ui)
