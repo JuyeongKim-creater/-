@@ -1,0 +1,87 @@
+import ipywidgets as widgets
+from IPython.display import display, SVG, clear_output
+import random
+
+# --- 1. [수정] 식물 종류 및 SVG 생성 함수 ---
+# 새로운 규칙에 맞게 식물 종류를 단순화하고, 그에 맞게 SVG 생성 로직을 수정합니다.
+PLANTS = {
+    'sprout': {'emoji': '🌱', 'size': 30},
+    'small_tree': {'emoji': '🌲', 'size': 40},
+    'big_tree': {'emoji': '🌳', 'size': 55},
+}
+
+def create_forest_svg(plant_type=None):
+    """
+    주어진 식물 타입에 맞는 숲 SVG 이미지를 생성합니다.
+    """
+    svg_elements = '<rect width="400" height="300" style="fill:skyblue" />'
+    svg_elements += '<rect y="250" width="400" height="50" style="fill:limegreen" />'
+    
+    if plant_type in PLANTS:
+        plant = PLANTS[plant_type]
+        # 화면 중앙에 식물이 나타나도록 위치 고정
+        x_pos = 180 
+        y_pos = 285 - plant['size']
+        svg_elements += f'<text x="{x_pos}" y="{y_pos}" font-size="{plant["size"]}">{plant["emoji"]}</text>'
+    else: # plant_type이 None이거나 없을 경우 (절감 실패)
+        svg_elements += '<text x="110" y="150" font-size="20">이번 주는 아쉽네요!<br/>다음 주 절약에 성공해서<br/>숲을 키워보세요!</text>'
+        
+    return f'<svg width="400" height="300" xmlns="http://www.w3.org/2000/svg">{svg_elements}</svg>'
+
+
+# --- 2. [수정] 사용자 입력을 위한 위젯(UI) 생성 ---
+last_week_input = widgets.FloatText(
+    value=1.5,
+    description='지난주 배출량(kg):', # 텍스트 변경
+    style={'description_width': 'initial'}
+)
+this_week_input = widgets.FloatText(
+    value=0.8,
+    description='이번 주 배출량(kg):', # 텍스트 변경
+    style={'description_width': 'initial'}
+)
+run_button = widgets.Button(
+    description="🌳 이번 주 숲 확인하기", # 텍스트 변경
+    button_style='success'
+)
+output_area = widgets.Output()
+
+
+# --- 3. [수정] 버튼 클릭 시 실행될 함수 정의 ---
+def on_run_button_clicked(b):
+    from IPython.display import SVG, display, clear_output
+    with output_area:
+        clear_output(wait=True)
+
+        last_week_co2 = last_week_input.value
+        this_week_co2 = this_week_input.value
+        
+        print(f"입력값: 지난주 {last_week_co2} kg, 이번 주 {this_week_co2} kg")
+        
+        reduction = last_week_co2 - this_week_co2
+        plant_to_grow = None # 기본값은 아무것도 없는 상태
+
+        # 새로운 규칙에 따라 어떤 식물이 자랄지 결정
+        if reduction >= 0.58:
+            plant_to_grow = 'big_tree'
+            print(f"✅ 탄소 저감량: {reduction:.2f} kg CO₂e -> 큰 나무가 자라나요!")
+        elif reduction >= 0.19:
+            plant_to_grow = 'small_tree'
+            print(f"✅ 탄소 저감량: {reduction:.2f} kg CO₂e -> 작은 나무가 자라나요!")
+        elif reduction > 0:
+            plant_to_grow = 'sprout'
+            print(f"✅ 탄소 저감량: {reduction:.2f} kg CO₂e -> 새싹이 돋아났어요!")
+        else:
+            print("❌ 이번 주에는 탄소를 저감하지 못했어요.")
+            
+        # 결정된 식물로 숲 이미지 생성 및 표시
+        forest_image_svg = create_forest_svg(plant_to_grow)
+        print("\n--- 이번 주 나의 숲 ---")
+        display(SVG(forest_image_svg))
+
+
+# --- 4. 버튼과 함수 연결 및 UI 표시 ---
+run_button.on_click(on_run_button_clicked)
+
+print("주간 탄소 배출량(kg CO₂e)을 입력하고 버튼을 눌러주세요.")
+display(last_week_input, this_week_input, run_button, output_area)
