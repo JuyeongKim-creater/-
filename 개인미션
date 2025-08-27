@@ -1,0 +1,157 @@
+# Colab/Jupyter: ipywidgets 드롭다운 UI로 목표 선택 → 추천
+!pip -q install ipywidgets pandas openpyxl
+
+import pandas as pd, numpy as np, re
+from ipywidgets import Dropdown, Button, VBox, HTML, Output
+from IPython.display import display
+
+# 1) 목표 프리셋 24개
+GOAL_PRESETS = [
+  # 환경·탄소
+  {"id":"carbon_reduce_combo","title":"탄소배출 줄이기","desc":"주 1회 채식 + 소고기→두부/가금 1회 전환","metric":"횟수","target":2,"period":"주간","tags":["environment","swap"]},
+  {"id":"veg2_per_week","title":"채식 2회 도전","desc":"일주일에 채식 식단 2회","metric":"회","target":2,"period":"주간","tags":["environment","veg"]},
+  {"id":"dairy_alt_2","title":"유제품 대체 2회","desc":"우유→식물성 음료 2회","metric":"회","target":2,"period":"주간","tags":["environment","dairy"]},
+  {"id":"mixdish_swap_1","title":"혼합요리 스왑","desc":"소고기 파스타→닭/두부 1회","metric":"회","target":1,"period":"주간","tags":["environment","swap"]},
+  {"id":"package_reduce_1","title":"포장 줄이기","desc":"벌크/리필 제품 1회 선택","metric":"회","target":1,"period":"주간","tags":["environment","package"]},
+  {"id":"leftover_reuse_1","title":"남은 음식 재사용","desc":"리메이크/활용 레시피 1회","metric":"회","target":1,"period":"주간","tags":["environment","leftover"]},
+  {"id":"seasonal_local_1","title":"제철·국내산 선택","desc":"제철/국내산 1회","metric":"회","target":1,"period":"주간","tags":["environment","local"]},
+  {"id":"weekly_tree","title":"나무 효과 달성","desc":"주간 저감량을 나무 10그루로 달성","metric":"그루","target":10,"period":"주간","tags":["environment","visual"]},
+
+  # 영양·건강
+  {"id":"veg_every_meal","title":"채소 위주 식단","desc":"매 끼니 채소 1큼, 일 총 3큼 달성","metric":"큼","target":3,"period":"일간","tags":["nutrition","veg"]},
+  {"id":"wholegrain_daily","title":"통곡물 1회 대체","desc":"흰쌀/빵→현미/오트/통밀 1회 전환","metric":"회","target":1,"period":"일간","tags":["nutrition","grain"]},
+  {"id":"fruit_colors_2","title":"과일 색 다양성","desc":"서로 다른 색 2회","metric":"회","target":2,"period":"일간","tags":["nutrition","fruit"]},
+  {"id":"fiber_daily_25","title":"식이섬유 목표","desc":"일 25 g 달성","metric":"g","target":25,"period":"일간","tags":["nutrition","fiber"]},
+  {"id":"protein_week_boost","title":"단백질 500 g/주 늘리기","desc":"주간 누적 단백질 500 g 추가 달성","metric":"g","target":500,"period":"주간","tags":["nutrition","protein"]},
+  {"id":"breakfast_protein_1","title":"아침 단백질 보강","desc":"요거트/달걀/두유 중 1","metric":"회","target":1,"period":"일간","tags":["nutrition","breakfast"]},
+  {"id":"hydration_6","title":"수분 루틴","desc":"하루 물 6컵","metric":"컵","target":6,"period":"일간","tags":["habit","hydration"]},
+  {"id":"low_salt_week","title":"저염 루틴","desc":"고염 식품 ≤3회/주","metric":"회","target":3,"period":"주간","tags":["nutrition","low_salt"]},
+
+  # 칼로리·리듬
+  {"id":"late_snack_zero","title":"야식 0kcal","desc":"밤 21시 이후 0 kcal","metric":"kcal","target":0,"period":"일간","tags":["habit","calorie"]},
+  {"id":"zero_liquid_cal","title":"액상 칼로리 0회","desc":"가당 음료 섭취 0회","metric":"회","target":0,"period":"일간","tags":["habit","sugar"]},
+  {"id":"snack_cap_250","title":"간식 캡","desc":"간식 250 kcal 이하","metric":"kcal","target":250,"period":"일간","tags":["habit","snack"]},
+  {"id":"half_rule_1","title":"절반 규칙","desc":"외식 1/2만 섭취·포장","metric":"회","target":1,"period":"일간","tags":["habit","portion"]},
+  {"id":"preload_satiety","title":"식전 포만감","desc":"식전 물1컵+채소 먼저","metric":"회","target":1,"period":"일간","tags":["habit","satiety"]},
+  {"id":"weekend_kcal_guard","title":"주말 관리","desc":"주말 일일 열량 목표치 이하","metric":"kcal","target":0,"period":"주간","tags":["habit","weekend"]},
+
+  # 기록·습관
+  {"id":"log_all_meals","title":"전 끼니 기록","desc":"아점저+간식 모두 기록","metric":"끼니","target":4,"period":"일간","tags":["record"]},
+  {"id":"photo_ocr_1","title":"사진+OCR 기록","desc":"영수증/식사 사진 1회","metric":"회","target":1,"period":"일간","tags":["record","ocr"]},
+  {"id":"streak_7days","title":"기록 연속 7일","desc":"공백 0일 유지","metric":"일","target":7,"period":"주간","tags":["record","streak"]},
+  {"id":"label_check_1","title":"라벨 확인","desc":"영양성분/원산지 확인 1회","metric":"회","target":1,"period":"일간","tags":["record","label"]},
+  {"id":"preset_menu_1","title":"프리셋 메뉴 활용","desc":"프리셋으로 빠른 기록 1회","metric":"회","target":1,"period":"주간","tags":["record","preset"]}
+]
+
+# 상위 목표 매핑
+PRESET_TO_PRIMARY = {
+  "carbon_reduce_combo":"carbon_reduce","veg2_per_week":"carbon_reduce","dairy_alt_2":"carbon_reduce",
+  "mixdish_swap_1":"carbon_reduce","package_reduce_1":"carbon_reduce","leftover_reuse_1":"carbon_reduce",
+  "seasonal_local_1":"carbon_reduce","weekly_tree":"carbon_reduce",
+
+  "veg_every_meal":"balanced","wholegrain_daily":"balanced","fruit_colors_2":"balanced",
+  "fiber_daily_25":"balanced","hydration_6":"balanced","low_salt_week":"balanced",
+  "log_all_meals":"balanced","photo_ocr_1":"balanced","streak_7days":"balanced",
+  "label_check_1":"balanced","preset_menu_1":"balanced",
+
+  "protein_week_boost":"muscle_gain","breakfast_protein_1":"muscle_gain",
+
+  "late_snack_zero":"weight_loss","zero_liquid_cal":"weight_loss","snack_cap_250":"weight_loss",
+  "half_rule_1":"weight_loss","preload_satiety":"weight_loss","weekend_kcal_guard":"weight_loss"
+}
+
+# 2) 엑셀 줄글 파서(현재 시트 구조 전용)
+def load_missions_from_excel_safe(xlsx_path: str, sheet_name: str = "gaeinmisyeon") -> pd.DataFrame:
+    df_raw = pd.read_excel(xlsx_path, sheet_name=sheet_name, header=None, dtype=str)
+    lines = []
+    for col in df_raw.columns:
+        for v in df_raw[col].fillna(""):
+            t = str(v).strip()
+            if t:
+                lines.append(t)
+
+    header_seen = False
+    recs = []
+    def is_sep(s): return "—" in s or s.startswith("[시트")
+
+    for line in lines:
+        if ("카테고리" in line) and ("미션ID" in line) and ("미션명" in line):
+            header_seen = True
+            continue
+        if not header_seen or is_sep(line):
+            continue
+
+        toks = line.split()
+        if len(toks) < 4:
+            continue
+
+        category = toks
+        mission_id = toks[1]
+        rest = toks[2:]
+
+        target, unit = "", ""
+        if len(rest) >= 2:
+            unit_c, target_c = rest[-1], rest[-2]
+            if not any(x in unit_c for x in ["첨부","생활","행동","개인화","연구","기사","팁","분석","시각","효과"]):
+                unit, target = unit_c, target_c
+                rest = rest[:-2]
+
+        text = " ".join(rest)
+        m = re.search(r"(첨부 기사:.*|생활 팁:.*|행동.*|개인화.*|연구.*|시각.*)$", text)
+        source = m.group(0).strip() if m else ""
+        description = text[:m.start()].strip() if m else text.strip()
+        title = description.split() if description else mission_id
+
+        recs.append({"category":category,"mission_id":mission_id,"title":title,
+                     "description":description,"target":target,"unit":unit,"source":source})
+
+    df = pd.DataFrame(recs).drop_duplicates("mission_id")
+    for c in ["title","description","target","unit","source"]:
+        df[c] = df[c].fillna("")
+    if df.empty:
+        raise ValueError("미션 파싱 실패: 시트명/구조를 확인하세요.")
+    return df
+
+# 3) 목표만으로 스코어링(칼로리/끼니 입력값 없음)
+def score_by_goal_only(df: pd.DataFrame, primary_goal: str) -> pd.Series:
+    s = pd.Series(0.0, index=df.index, dtype=float)
+    if primary_goal == "carbon_reduce":
+        s += (df["mission_id"].isin(["lowco2_swap","veg_meal_once","dairy_alt","mixdish_swap",
+                                     "package_reduce","leftover_reuse","weekly_reduction","zero_waste"]))*3
+    elif primary_goal == "weight_loss":
+        s += (df["mission_id"].isin(["no_late_snack","snack_kcal_cap","zero_liquid_cal",
+                                     "half_rule","preload_water_veg"]))*3
+    elif primary_goal == "muscle_gain":
+        s += (df["mission_id"].isin(["protein_boost","protein_breakfast","weekly_protein_days"]))*3
+    else:  # balanced
+        s += (df["mission_id"].isin(["log_all_meals","preset_menu","weekly_review","today_pick",
+                                     "wholegrain_swap","veg_servings","fruits_variety"]))*3
+    return s
+
+def choose_missions_goal_only(df: pd.DataFrame, primary_goal: str, top_k: int = 3) -> pd.DataFrame:
+    s = score_by_goal_only(df, primary_goal)
+    rng = np.random.RandomState(None)
+    out = df.assign(score=s.values + rng.rand(len(df))*0.001)
+    rec = out.sort_values("score", ascending=False).head(top_k)
+    return rec[["mission_id","title","description","target","unit","category"]].reset_index(drop=True)
+
+# 4) 데이터 로드
+df = load_missions_from_excel_safe("gaeinmisyeon.xlsx", "gaeinmisyeon")
+
+# 5) 드롭다운 UI
+options = [(f"{g['title']} · {g['desc']} ({g['period']}·{g['target']}{g['metric']})", g["id"]) for g in GOAL_PRESETS]
+dd = Dropdown(options=options, description="목표 선택", layout={'width':'95%'})
+btn = Button(description="추천 보기", button_style='primary')
+out = Output()
+
+def on_click(_):
+    out.clear_output()
+    preset_id = dd.value
+    primary = PRESET_TO_PRIMARY.get(preset_id, "balanced")
+    rec = choose_missions_goal_only(df, primary, top_k=3)
+    with out:
+        display(HTML("<h4>추천 미션 Top-3</h4>"))
+        display(rec)
+
+btn.on_click(on_click)
+display(VBox([dd, btn, out]))
