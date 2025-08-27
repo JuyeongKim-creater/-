@@ -1,61 +1,26 @@
-# ===================== Colab: 2025-08 식단 달력 (xls 에러 고정, 제외목록 반영, 2000~2500 kcal) =====================
+# ===================== Colab: 2025-08 식단 달력 (속도 개선 버전) =====================
+# .xls 지원을 위한 불필요한 재설치 과정 제거
 import sys, subprocess, importlib, os, io, re, calendar, random
 from datetime import date
 from IPython.display import display, HTML
-
-# -------- 0) .xls 지원 환경 확정: pandas==1.5.3 + xlrd==1.2.0 --------
-def ensure_legacy_xls_support():
-    """
-    - pandas 2.x 는 xlrd 2.x를 요구하지만 .xls는 지원하지 않음
-    - Colab에서 .xls를 안정적으로 읽기 위해 pandas==1.5.3 + xlrd==1.2.0 고정
-    """
-    need_fix = False
-    try:
-        import pandas as pd
-        pv_major = int(pd.__version__.split(".")[0])
-        if pv_major >= 2:
-            need_fix = True
-    except Exception:
-        need_fix = True
-
-    try:
-        import xlrd
-        xv_major = int(xlrd.__version__.split(".")[0])
-        if xv_major >= 2:  # 2.x는 .xls 미지원
-            need_fix = True
-    except Exception:
-        need_fix = True
-
-    if need_fix:
-        print("🔧 .xls 지원을 위해 pandas==1.5.3, xlrd==1.2.0으로 재설치합니다...")
-        subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "pandas", "xlrd"], check=False)
-        subprocess.run([sys.executable, "-m", "pip", "install", "--no-cache-dir",
-                        "pandas==1.5.3", "xlrd==1.2.0", "openpyxl", "numpy", "ipywidgets"], check=True)
-        importlib.invalidate_caches()
-        print("✅ 설치 정비 완료.")
-
-ensure_legacy_xls_support()
-
 import numpy as np
 import pandas as pd
 from google.colab import files
 
 # -------- 1) 사용자 업로드(선택) + 기본 경로 --------
-print("엑셀을 업로드하려면 팝업에서 '원재료.xls / 가공식품.xlsx / 요리.xlsx'를 선택하세요. (건너뛰면 /mnt/data 파일 사용)")
+# .xlsx 파일 사용을 전제로 하므로, 더 이상 pandas 버전을 강제로 낮출 필요가 없습니다.
+print("엑셀을 업로드하려면 팝업에서 '원재료.xlsx / 가공식품.xlsx / 요리.xlsx'를 선택하세요. (건너뛰면 /mnt/data 파일 사용)")
 try:
     uploaded = files.upload()  # 업로드는 선택 사항
     UP_FILES = list(uploaded.keys())
 except Exception:
     UP_FILES = []
 
+# 원재료.xls -> 원재료.xlsx 로 변경
 DEFAULT_FILES = [
-    "/mnt/data/원재료.xls",
+    "/mnt/data/원재료.xlsx",
     "/mnt/data/가공식품.xlsx",
     "/mnt/data/요리.xlsx",
-    # 여분(한글 조합 이슈 대비)
-    "/mnt/data/원재료.xls",
-    "/mnt/data/가공식품.xlsx",
-    "/mnt/data/요리.xlsx",
 ]
 
 def _read_excel_any(local_path: str) -> pd.DataFrame:
@@ -64,14 +29,13 @@ def _read_excel_any(local_path: str) -> pd.DataFrame:
     """
     ext = os.path.splitext(local_path)[1].lower()
     try:
-        if ext == ".xls":
-            xls = pd.ExcelFile(local_path, engine="xlrd")
-            return pd.read_excel(xls, sheet_name=xls.sheet_names[0], engine="xlrd")
-        else:  # .xlsx
-            xls = pd.ExcelFile(local_path, engine="openpyxl")
-            return pd.read_excel(xls, sheet_name=xls.sheet_names[0], engine="openpyxl")
+        # .xls 지원 코드를 제거하고 .xlsx에 집중합니다.
+        # 최신 pandas는 openpyxl을 기본으로 잘 사용합니다.
+        xls = pd.ExcelFile(local_path, engine="openpyxl")
+        return pd.read_excel(xls, sheet_name=xls.sheet_names[0], engine="openpyxl")
     except Exception as e1:
         try:
+            # 엔진 자동 감지로 재시도
             xls = pd.ExcelFile(local_path)
             return pd.read_excel(xls, sheet_name=xls.sheet_names[0])
         except Exception as e2:
@@ -96,11 +60,11 @@ def load_sources() -> pd.DataFrame:
                     df = _read_excel_any(p)
                     df.columns = [str(c).strip() for c in df.columns]
                     if not df.empty: dfs.append(df)
-                    else: print(f"⚠ 빈 시트 건누뜀: {p}")
+                    else: print(f"⚠ 빈 시트 건너뜀: {p}")
                 except Exception as e:
                     print(f"⚠ 파일 읽기 실패: {p} -> {e}")
     if not dfs:
-        raise RuntimeError("엑셀을 찾지 못했습니다. /mnt/data 경로에 '원재료.xls, 가공식품.xlsx, 요리.xlsx' 중 하나 이상을 두거나 업로드하세요.")
+        raise RuntimeError("엑셀을 찾지 못했습니다. /mnt/data 경로에 '원재료.xlsx, 가공식품.xlsx, 요리.xlsx' 중 하나 이상을 두거나 업로드하세요.")
     return pd.concat(dfs, ignore_index=True, sort=False)
 
 # -------- 2) 표준화(식품명/단위/kcal) --------
@@ -248,22 +212,23 @@ def make_meal_calendar(year:int, month:int, seed:int=123, show=True):
         b = int(row["kcal_breakfast"]); l = int(row["kcal_lunch"]); dn = int(row["kcal_dinner"])
         # 총 kcal 크게, 아래 줄 아침/점심/저녁 kcal
         return f"""
-        <td style="vertical-align:top; width:120px; height:92px; padding:8px;">
+        <td style="vertical-align:top; width:120px; height:92px; padding:8px; border: 1px solid #eee;">
           <div style="font-weight:600; margin-bottom:4px;">{day_num}</div>
           <div style="font-size:18px; font-weight:700;">{top}</div>
           <div style="color:#666; font-size:12px;">{b}/{l}/{dn}</div>
         </td>"""
 
     html = f"""
-    <div style="font-size:20px; font-weight:700; margin:8px 0;">달력</div>
-    <div style="font-size:16px; margin-bottom:6px;">{month_name}</div>
-    <table border="0" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
-      <thead><tr>{"".join(f'<th style="width:120px; padding:6px; color:#666;">{w}</th>' for w in wk_names)}</tr></thead>
-      <tbody>
+    <div style="font-family: sans-serif; padding: 10px;">
+        <div style="font-size:20px; font-weight:700; margin:8px 0;">달력</div>
+        <div style="font-size:16px; margin-bottom:12px;">{month_name}</div>
+        <table border="0" cellspacing="0" cellpadding="0" style="border-collapse:collapse; width: 100%; text-align: center;">
+          <thead><tr>{"".join(f'<th style="width:14.2%; padding:8px; color:#333; background-color:#f8f9fa;">{w}</th>' for w in wk_names)}</tr></thead>
+          <tbody>
     """
     for week in cgrid:
         html += "<tr>" + "".join(cell_html(dn) for dn in week) + "</tr>"
-    html += "</tbody></table>"
+    html += "</tbody></table></div>"
 
     if show: display(HTML(html))
     return df_month, plans, html
@@ -274,10 +239,11 @@ df_aug, plans_aug, cal_html = make_meal_calendar(2025, 8, seed=777, show=True)
 # 모든 날짜의 자동 구성 메뉴(메뉴명·양·kcal) 전체 출력
 def show_month_details(plans_dict, y, m):
     last_day = calendar.monthrange(y, m)[1]
+    print("\n" + "="*20 + " 상세 식단 정보 " + "="*20)
     for d in range(1, last_day+1):
         k = date(y, m, d)
         meals = plans_dict.get(k, {})
-        print(f"\n[{y}-{m:02d}-{d:02d}] 자동 구성 메뉴")
+        print(f"\n🗓️ [{y}-{m:02d}-{d:02d}] 자동 구성 메뉴")
         for meal in ["아침","점심","저녁"]:
             items = meals.get(meal, [])
             line = " + ".join([f"{nm} {amt}{u}({int(kc)}kcal)" for nm,amt,u,kc in items]) or "-"
