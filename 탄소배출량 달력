@@ -1,0 +1,255 @@
+# ===================== Colab: 2025-08 월별 탄소 배출량 달력 (끼니별 분석) =====================
+# 설명: '요리_food_group_분류완료.xlsx' 파일을 기반으로 아침, 점심, 저녁 식단을 시뮬레이션하고,
+#       각 끼니별로 단계적 탄소 배출량을 계산하여 달력으로 시각화합니다.
+import sys, os, re, calendar, random
+from datetime import date
+from IPython.display import display, HTML
+import numpy as np
+import pandas as pd
+from google.colab import files
+
+# -------- 1) 사용자 데이터 업로드 + 기본 경로 --------
+print("엑셀을 업로드하려면 팝업에서 '요리_food_group_분류완료.xlsx' 파일을 선택하세요.")
+try:
+    uploaded = files.upload()
+    UP_FILES = list(uploaded.keys())
+except Exception:
+    UP_FILES = []
+
+DEFAULT_FILE = "/mnt/data/요리_food_group_분류완료.xlsx"
+
+def load_food_data() -> pd.DataFrame:
+    """
+    업로드된 파일 또는 기본 경로의 음식 데이터 엑셀 파일을 로드합니다.
+    """
+    df = None
+    if UP_FILES:
+        try:
+            df = pd.read_excel(UP_FILES[0])
+        except Exception as e:
+            print(f"⚠ 업로드 파일 읽기 실패: {e}")
+
+    if df is None and os.path.exists(DEFAULT_FILE):
+        try:
+            df = pd.read_excel(DEFAULT_FILE)
+        except Exception as e:
+            print(f"⚠ 기본 경로 파일 읽기 실패: {e}")
+
+    if df is None or df.empty:
+        raise RuntimeError("음식 데이터 엑셀 파일을 찾지 못했습니다. '요리_food_group_분류완료.xlsx' 파일을 업로드하거나 경로를 확인하세요.")
+
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+# -------- 2) 탄소 배출 계수 데이터 정의 (이미지 기반) --------
+EMISSION_FACTORS_RAW = {
+    'stage': ['농장', '농장', '농장', '농장', '농장', '농장', '농장', '농장', '농장', '농장', '공장', '공장', '공장', '유통', '유통', '유통', '매장', '매장', '매장'],
+    'item': ['소고기', '돼지고기', '닭고기', '계란', '유제품', '쌀', '과일', '채소', '수산물(양식)', '수산물(자연산)', '가공', '살균/멸균', '포장', '국산(트럭)', '해상운송', '항공운송', '냉장/냉동', '조명 및 기타', '식품 폐기'],
+    'emission_factor': [48, 5.5, 4.8, 2.5, 2, 3, 0.4, 0.2, 3.5, 1.5, 0.4, 0.3, 0.2, 0.1, 2, 25, 0.2, 0.1, 0.2],
+    'map_group': ['육류', '육류', '육류', '계란', '유제품', '주식', '과일', '채소', '수산물', '수산물', '가공', '살균', '포장', '국산', '해상', '항공', '냉장', '기타', '폐기']
+}
+EMISSION_FACTORS = pd.DataFrame(EMISSION_FACTORS_RAW)
+
+# -------- 3) 데이터 표준화 및 전처리 --------
+def normalize_food_data(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    음식 데이터의 컬럼을 확인하고, 1회 제공량(g)을 파싱하여 새로운 컬럼으로 추가합니다.
+    """
+    df = df_raw.copy()
+    required_cols = ['식품명', '영양성분함량기준량', 'food_group', 'meal_type']
+    if not all(col in df.columns for col in required_cols):
+        raise ValueError(f"엑셀 파일에 필수 컬럼({required_cols})이 모두 포함되어야 합니다. 현재 컬럼: {df.columns}")
+
+    def parse_serving_g(s):
+        s = str(s).lower()
+        match = re.search(r'([\d\.]+)\s*g', s)
+        if match: return float(match.group(1))
+        match = re.search(r'([\d\.]+)\s*ml', s)
+        if match: return float(match.group(1))
+        return 100.0
+
+    df['serving_g'] = df['영양성분함량기준량'].apply(parse_serving_g)
+    return df.dropna(subset=required_cols).reset_index(drop=True)
+
+# -------- 4) 끼니별 탄소 배출량 계산 함수 --------
+# 🔴 [오류 수정] food_group을 배출 계수 그룹(map_group)으로 연결하는 딕셔너리 추가
+FOOD_GROUP_MAP = {
+    '주식': '주식',
+    '국/찌개': '육류',       # 주 재료가 육류/수산물인 경우가 많다고 가정
+    '메인반찬': '육류',       # 주 재료가 육류/수산물인 경우가 많다고 가정
+    '샐러드/무침': '채소',
+    '기타반찬': '채소',
+    '음료': '과일'          # 과일 주스 등으로 가정
+}
+
+def calculate_emission_for_meal(food: pd.Series, factors_df: pd.DataFrame, rng: random.Random):
+    """
+    하나의 음식 메뉴에 대해 농장-공장-유통-매장 전 단계의 탄소 배출량을 계산합니다.
+    """
+    details = {}
+    total_emission = 0.0
+    food_kg = food['serving_g'] / 1000
+
+    # 1. 농장
+    # 🔴 [오류 수정] food_group을 FOOD_GROUP_MAP을 통해 map_key로 변환
+    base_group = food['food_group'].split('/')[0]
+    map_key = FOOD_GROUP_MAP.get(base_group, '채소') # 맵에 없는 경우 '채소'를 기본값으로 사용
+    
+    factor_row = factors_df[(factors_df['stage'] == '농장') & (factors_df['map_group'] == map_key)]
+    farm_emission = 0
+    if not factor_row.empty:
+        factor = factor_row.sample(1, random_state=rng.randint(1, 10**9)).iloc[0]
+        farm_emission = factor['emission_factor'] * food_kg
+    details['농장'] = farm_emission
+    total_emission += farm_emission
+
+    # 2. 공장
+    processing = factors_df[factors_df['map_group'] == '가공'].iloc[0]
+    packaging = factors_df[factors_df['map_group'] == '포장'].iloc[0]
+    factory_emission = (processing['emission_factor'] + packaging['emission_factor']) * food_kg
+    details['공장'] = factory_emission
+    total_emission += factory_emission
+
+    # 3. 유통
+    choice = rng.choices(['국산', '해상', '항공'], weights=[70, 25, 5], k=1)[0]
+    dist_method = factors_df[factors_df['map_group'] == choice].iloc[0]
+    distance_km = {'국산': 150, '해상': 8000, '항공': 10000}[choice]
+    dist_emission = dist_method['emission_factor'] * (food_kg / 1000) * distance_km # t.km 단위
+    details['유통'] = dist_emission
+    total_emission += dist_emission
+
+    # 4. 매장
+    refrigeration = factors_df[factors_df['map_group'] == '냉장'].iloc[0]
+    food_waste = factors_df[factors_df['map_group'] == '폐기'].iloc[0]
+    store_emission = (refrigeration['emission_factor'] * food_kg) + (food_waste['emission_factor'] * food_kg * 0.1)
+    details['매장'] = store_emission
+    total_emission += store_emission
+
+    return {'food_name': food['식품명'], 'total': total_emission, 'details': details, 'group': food['food_group']}
+
+# -------- 5) 일일 탄소 배출량 시뮬레이션 (로직 수정) --------
+def simulate_daily_emissions(food_df: pd.DataFrame, factors_df: pd.DataFrame, rng: random.Random):
+    """
+    아침, 점심, 저녁 각 끼니별로 '주식 + 반찬' 메뉴를 선택하고 탄소 배출량을 계산합니다.
+    """
+    daily_plan = {}
+    # 1. 식단 구성
+    for meal_type in ['아침', '점심', '저녁']:
+        meal_foods_info = []
+        meal_total_emission = 0
+        
+        # 1-1. 주식 선택
+        main_options = food_df[(food_df['meal_type'] == meal_type) & (food_df['food_group'] == '주식')]
+        if not main_options.empty:
+            chosen_main = main_options.sample(1, random_state=rng.randint(1, 10**9)).iloc[0]
+            main_emission_info = calculate_emission_for_meal(chosen_main, factors_df, rng)
+            meal_foods_info.append(main_emission_info)
+            meal_total_emission += main_emission_info['total']
+
+        # 1-2. 반찬 선택
+        side_dish_groups = ['국/찌개', '샐러드/무침', '메인반찬', '기타반찬', '음료']
+        side_options = food_df[(food_df['meal_type'] == meal_type) & (food_df['food_group'].isin(side_dish_groups))]
+        if not side_options.empty:
+            chosen_side = side_options.sample(1, random_state=rng.randint(1, 10**9)).iloc[0]
+            side_emission_info = calculate_emission_for_meal(chosen_side, factors_df, rng)
+            meal_foods_info.append(side_emission_info)
+            meal_total_emission += side_emission_info['total']
+            
+        daily_plan[meal_type] = {'foods': meal_foods_info, 'total': meal_total_emission}
+
+    # 2. 일일 총합 계산
+    daily_total = sum(v['total'] for v in daily_plan.values())
+    daily_plan['total_emission'] = daily_total
+    return daily_plan
+
+# -------- 6) 달력 생성 + 표기 (로직 수정) --------
+def make_emission_calendar(year: int, month: int, seed: int = 123, show=True):
+    food_raw = load_food_data()
+    FOOD_DATA = normalize_food_data(food_raw)
+
+    rng = random.Random(seed)
+    last_day = calendar.monthrange(year, month)[1]
+    days = [date(year, month, d) for d in range(1, last_day + 1)]
+
+    plans = {}
+    rows = []
+    for d in days:
+        daily_plan = simulate_daily_emissions(FOOD_DATA, EMISSION_FACTORS, rng)
+        plans[d] = daily_plan
+        rows.append({
+            "date": pd.Timestamp(d),
+            "total_emission_kg": daily_plan['total_emission'],
+            "breakfast_kg": daily_plan.get('아침', {}).get('total', 0),
+            "lunch_kg": daily_plan.get('점심', {}).get('total', 0),
+            "dinner_kg": daily_plan.get('저녁', {}).get('total', 0)
+        })
+
+    df_month = pd.DataFrame(rows).fillna(0)
+
+    cgrid = calendar.monthcalendar(year, month)
+    wk_names = ["일", "월", "화", "수", "목", "금", "토"]
+    month_name = f"{year}년 {month}월 탄소 발자국"
+
+    def cell_html(day_num):
+        if day_num == 0: return "<td></td>"
+        d = pd.Timestamp(date(year, month, day_num))
+        row = df_month[df_month["date"] == d].iloc[0]
+        total_kg = row["total_emission_kg"]
+        b = row["breakfast_kg"]; l = row["lunch_kg"]; dn = row["dinner_kg"]
+        
+        plan = plans.get(d.date(), {})
+        
+        def get_meal_names(meal_type):
+            foods = plan.get(meal_type, {}).get('foods', [])
+            return " + ".join([f['food_name'] for f in foods]) or "없음"
+
+        b_name = get_meal_names('아침')
+        l_name = get_meal_names('점심')
+        d_name = get_meal_names('저녁')
+        tooltip = f"아침: {b_name} ({b:.2f}kg)&#10;점심: {l_name} ({l:.2f}kg)&#10;저녁: {d_name} ({dn:.2f}kg)"
+
+        return f"""
+        <td style="vertical-align:top; width:120px; height:92px; padding:8px; border: 1px solid #eee;" title="{tooltip}">
+          <div style="font-weight:600; margin-bottom:4px;">{day_num}</div>
+          <div style="font-size:18px; font-weight:700; color:#c0392b;">{total_kg:.2f} kg</div>
+          <div style="color:#666; font-size:11px;">{b:.1f}/{l:.1f}/{dn:.1f}</div>
+        </td>"""
+
+    html = f"""
+    <div style="font-family: sans-serif; padding: 10px;">
+        <div style="font-size:20px; font-weight:700; margin:8px 0;">탄소 배출량 달력 (끼니별 분석)</div>
+        <div style="font-size:16px; margin-bottom:12px;">{month_name}</div>
+        <table border="0" cellspacing="0" cellpadding="0" style="border-collapse:collapse; width: 100%; text-align: center;">
+          <thead><tr>{"".join(f'<th style="width:14.2%; padding:8px; color:#333; background-color:#f8f9fa;">{w}</th>' for w in wk_names)}</tr></thead>
+          <tbody>{"".join("<tr>" + "".join(cell_html(dn) for dn in week) + "</tr>" for week in cgrid)}</tbody>
+        </table>
+    </div>"""
+
+    if show: display(HTML(html))
+    return df_month, plans, html
+
+# -------- 7) 상세 내역 출력 (로직 수정) --------
+def show_month_details(plans_dict, y, m):
+    last_day = calendar.monthrange(y, m)[1]
+    print("\n" + "="*20 + " 일별 상세 배출 내역 " + "="*20)
+    for d in range(1, last_day + 1):
+        k = date(y, m, d)
+        plan = plans_dict.get(k, {})
+        total = plan.get('total_emission', 0)
+        print(f"\n🗓️ [{y}-{m:02d}-{d:02d}] 탄소 배출 상세 내역 (총 {total:.2f} kg CO₂eq)")
+        for meal_type in ['아침', '점심', '저녁']:
+            meal_info = plan.get(meal_type, {})
+            if meal_info:
+                meal_total = meal_info.get('total', 0)
+                foods = meal_info.get('foods', [])
+                food_names = " + ".join([f['food_name'] for f in foods]) or "없음"
+                print(f"  - {meal_type}: {food_names} (총 {meal_total:.2f} kg)")
+                
+                for food_item in foods:
+                    details = food_item['details']
+                    details_str = ", ".join([f"{stage} {em:.2f}kg" for stage, em in details.items()])
+                    print(f"    └ ({food_item['group']}) {food_item['food_name']}: {details_str}")
+
+# ===================== 실행: 2025년 8월 =====================
+df_result, plans_result, _ = make_emission_calendar(2025, 8, seed=999, show=True)
+show_month_details(plans_result, 2025, 8)
